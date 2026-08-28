@@ -2,35 +2,28 @@
 
 Bot Telegram cho **nhauphitruong.com** → nhóm *Seo Web Nhậu Phi Trường*.
 
-## 3 việc bot làm
+## Kiến trúc
 
-| Việc | File | Lịch | Mô tả |
-|---|---|---|---|
-| Báo bài mới + bài đặt lịch lên web | `poster.py` | mỗi 30' | Ping `wp-cron.php` để đẩy bài **đặt lịch** tới hạn → publish, rồi báo mọi bài **mới publish** về nhóm (ảnh + link). |
-| Ép index hàng ngày | `indexer.py` | 08:00 VN | Đọc sitemap → gửi URL mới/sửa lên Google Indexing API + IndexNow → báo tóm tắt về nhóm. |
-
-Chạy trên **GitHub Actions** (miễn phí, repo public). Không đụng gì tới theme/website.
-
-## Secrets (Settings → Secrets and variables → Actions)
-
-| Secret | Bắt buộc | Ghi chú |
+| Việc | Ở đâu | Lịch |
 |---|---|---|
-| `TELEGRAM_TOKEN` | ✅ | Token bot |
-| `TELEGRAM_CHAT_ID` | ✅ | ID nhóm (số âm) |
-| `GOOGLE_SA_JSON` | tùy | Toàn bộ JSON service account để **ép index Google**. Xem dưới. |
-| `INDEXNOW_KEY` | tùy | Key IndexNow (Bing/Cốc Cốc). Cần đặt file `<key>.txt` ở gốc web. |
+| Báo **bài đặt lịch** + **bài đăng lên web** (real-time, kèm ảnh/link) | mu-plugin `npt-telegram-posts.php` trên WordPress | ngay khi lên lịch / đăng |
+| **Ép index** + báo cáo trạng thái (đã/chưa index, kiểu Tuấn Tú) | `indexer.py` (GitHub Actions) | 08:00 VN mỗi ngày |
+| **Heartbeat** ping wp-cron để bài đặt lịch đăng đúng giờ | `poster.py` (GitHub Actions) | mỗi 15 phút |
 
-### Bật ép-index Google (5 phút, chỉ bạn làm được)
-1. Google Cloud Console → tạo Project → bật **Indexing API**.
-2. Tạo **Service Account** → tạo key JSON → tải về.
-3. Mở JSON, copy `client_email` (dạng `...@...iam.gserviceaccount.com`).
-4. [Search Console](https://search.google.com/search-console) của nhauphitruong.com → **Cài đặt → Người dùng và quyền → Thêm người dùng** → dán email đó → quyền **Chủ sở hữu**.
-5. Dán **toàn bộ nội dung file JSON** vào secret `GOOGLE_SA_JSON`.
-→ Lần index kế tiếp sẽ tự đẩy Google. (Quota mặc định ~200 URL/ngày.)
+> Thông báo bài viết do **mu-plugin làm real-time** (thấy cả bài đặt lịch). GitHub Actions
+> chỉ lo ép index + ping wp-cron. Vì vậy không có thông báo trùng.
 
-## Trạng thái
-`state.json` lưu id các bài đã báo. Lần chạy đầu: coi toàn bộ bài hiện có là "đã báo"
-(không dội kho cũ) — chỉ bài mới sau đó mới thông báo.
+## Secrets (GitHub → Settings → Secrets and variables → Actions)
+| Secret | Dùng cho |
+|---|---|
+| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | báo cáo index |
+| `GOOGLE_SA_JSON` | Google Indexing API + URL Inspection (SA là Chủ sở hữu property URL-prefix) |
 
-## Chạy tay
-Actions → chọn workflow (`poster`/`indexer`) → **Run workflow**.
+## mu-plugin
+File `wp-content/mu-plugins/npt-telegram-posts.php` (token/chat nhúng trong file, chạy server-side).
+Hook `transition_post_status`: → `future` báo "ĐÃ LÊN LỊCH"; → `publish` báo "Bài mới". Mỗi bài
+báo 1 lần (dùng post meta chống trùng). Chỉ áp dụng `post_type = post`.
+
+## Báo cáo index
+`indexer.py` đọc sitemap → URL Inspection API phân loại đã/chưa index → ép index (Indexing API)
+các URL chưa index → gửi báo cáo về nhóm. SA `npt-indexer@mephil-fb-bot.iam.gserviceaccount.com`.

@@ -1,14 +1,11 @@
-name: poster
+name: heartbeat
 on:
   schedule:
-    - cron: "*/30 * * * *"   # mỗi 30 phút
+    - cron: "*/15 * * * *"   # mỗi 15 phút: đẩy bài đặt lịch tới hạn -> publish đúng giờ
   workflow_dispatch: {}
 
-permissions:
-  contents: write
-
 concurrency:
-  group: poster
+  group: heartbeat
   cancel-in-progress: false
 
 jobs:
@@ -20,19 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install --quiet requests
-      - name: Run poster
+      - name: Ping wp-cron
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE: https://nhauphitruong.com
         run: python poster.py
-      - name: Commit state if changed
-        run: |
-          if ! git diff --quiet state.json; then
-            git config user.name "npt-bot"
-            git config user.email "bot@users.noreply.github.com"
-            git add state.json
-            git commit -m "state: cap nhat bai da gui [skip ci]"
-            git push
-          else
-            echo "state khong doi"
-          fi
