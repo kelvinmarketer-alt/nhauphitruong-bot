@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Indexer bot — Nhậu Phi Trường (chạy hàng ngày).
-  1) Đọc sitemap (Rank Math) -> gom toàn bộ URL + lastmod.
-  2) Chọn URL mới/ vừa sửa trong N ngày gần đây (+ trang chủ) để ép index.
-  3) Nếu có GOOGLE_SA_JSON  -> gửi Google Indexing API (ép Google).
-     Nếu có INDEXNOW_KEY    -> gửi IndexNow (Bing/Yandex/Cốc Cốc).
-  4) Báo tóm tắt về nhóm Telegram.
-Không có secret nào của Google/IndexNow thì vẫn báo cáo sitemap + hướng dẫn bật.
+Indexer bot — Nhậu Phi Trường (chạy hàng ngày). Mẫu báo cáo giống bot Tuấn Tú.
+  1) Đọc sitemap (Rank Math) -> gom toàn bộ URL.
+  2) URL Inspection API kiểm tra TỪNG URL: đã index / chưa index / lỗi.
+  3) Ép index lại (Indexing API) các URL CHƯA index.
+  4) Báo cáo về nhóm Telegram: đã/chưa/lỗi + danh sách URL chưa index + coverageState.
+Cần secret GOOGLE_SA_JSON (SA là Chủ sở hữu property URL-prefix trong Search Console).
 """
 import os, json, time, html, datetime as dt
 import xml.etree.ElementTree as ET
 import requests
 
-SITE   = os.environ.get("SITE", "https://nhauphitruong.com").rstrip("/")
-TOKEN  = os.environ["TELEGRAM_TOKEN"]
-CHAT   = os.environ["TELEGRAM_CHAT_ID"]
-SA_RAW = os.environ.get("GOOGLE_SA_JSON", "").strip()
-IN_KEY = os.environ.get("INDEXNOW_KEY", "").strip()
-DAYS   = int(os.environ.get("INDEX_DAYS", "3"))
-MAXG   = int(os.environ.get("GOOGLE_MAX", "180"))  # quota mặc định Google ~200/ngày
-UA     = "Mozilla/5.0 (compatible; NPT-Indexer/1.0)"
-TG     = f"https://api.telegram.org/bot{TOKEN}"
-NS     = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+SITE     = os.environ.get("SITE", "https://nhauphitruong.com").rstrip("/")
+SITE_URL = os.environ.get("SC_SITE_URL", SITE + "/")   # property URL-prefix SA sở hữu
+TOKEN    = os.environ["TELEGRAM_TOKEN"]
+CHAT     = os.environ["TELEGRAM_CHAT_ID"]
+SA_RAW   = os.environ.get("GOOGLE_SA_JSON", "").strip()
+MAX_INSPECT = int(os.environ.get("MAX_INSPECT", "180"))  # quota URL Inspection ~2000/ngày
+MAX_PUSH    = int(os.environ.get("MAX_PUSH", "180"))     # quota Indexing ~200/ngày
+UA  = "Mozilla/5.0 (compatible; NPT-Indexer/2.0)"
+TG  = f"https://api.telegram.org/bot{TOKEN}"
+NS  = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+SCOPES = ["https://www.googleapis.com/auth/indexing",
+          "https://www.googleapis.com/auth/webmasters.readonly"]
 
 def log(*a): print(*a, flush=True)
 
@@ -30,7 +31,6 @@ def get(url):
     return requests.get(url, headers={"User-Agent": UA}, timeout=40)
 
 def parse_sitemap(url, out, depth=0):
-    """Đệ quy: sitemap index -> các sitemap con -> url."""
     try:
         r = get(url)
         if r.status_code != 200: return
@@ -42,65 +42,53 @@ def parse_sitemap(url, out, depth=0):
         for sm in root.findall(f"{NS}sitemap"):
             loc = sm.findtext(f"{NS}loc")
             if loc: parse_sitemap(loc, out, depth+1)
-    else:  # urlset
+    else:
         for u in root.findall(f"{NS}url"):
             loc = u.findtext(f"{NS}loc")
-            lastmod = u.findtext(f"{NS}lastmod")
-            if loc: out[loc] = lastmod
+            if loc: out.append(loc)
 
-def recent_urls(all_urls, days):
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
-    picked = []
-    for loc, lastmod in all_urls.items():
-        if not lastmod:
-            continue
-        try:
-            d = dt.datetime.fromisoformat(lastmod.replace("Z", "+00:00"))
-            if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
-            if d >= cutoff:
-                picked.append(loc)
-        except Exception:
-            continue
-    home = SITE + "/"
-    if home not in picked: picked.append(home)
-    return picked
+def make_session():
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import AuthorizedSession
+    info = json.loads(SA_RAW)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return AuthorizedSession(creds)
 
-def google_index(urls):
-    if not SA_RAW: return None
+# nhãn coverageState tiếng Việt gọn
+COV_VI = {
+    "Submitted and indexed": "Đã gửi & đã index",
+    "Indexed, not submitted in sitemap": "Đã index (ngoài sitemap)",
+    "Discovered - currently not indexed": "Đã phát hiện, chưa index",
+    "Crawled - currently not indexed": "Đã thu thập, chưa index",
+    "URL is unknown to Google": "Google chưa biết URL",
+    "Page with redirect": "Trang chuyển hướng",
+    "Duplicate without user-selected canonical": "Trùng lặp, chưa chọn canonical",
+    "Excluded by 'noindex' tag": "Bị chặn bởi thẻ noindex",
+}
+
+def inspect(sess, url):
+    """Trả (state, cov) — state: indexed|not|error ; cov: coverageState gốc."""
     try:
-        from google.oauth2 import service_account
-        from google.auth.transport.requests import AuthorizedSession
-        info = json.loads(SA_RAW)
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/indexing"])
-        sess = AuthorizedSession(creds)
+        r = sess.post("https://searchconsole.googleapis.com/v1/urlInspection/index:inspect",
+                      json={"inspectionUrl": url, "siteUrl": SITE_URL}, timeout=40)
+        if r.status_code != 200:
+            log("inspect", r.status_code, url, r.text[:120]); return ("error", f"HTTP {r.status_code}")
+        idx = r.json().get("inspectionResult", {}).get("indexStatusResult", {})
+        verdict = idx.get("verdict", "")            # PASS / NEUTRAL / FAIL / VERDICT_UNSPECIFIED
+        cov = idx.get("coverageState", "Unknown")
+        if verdict == "PASS":
+            return ("indexed", cov)
+        return ("not", cov)
     except Exception as e:
-        log("Google auth fail:", e); return {"ok": 0, "fail": 0, "err": str(e)}
-    ok = fail = 0
-    for u in urls[:MAXG]:
-        try:
-            r = sess.post("https://indexing.googleapis.com/v3/urlNotifications:publish",
-                          json={"url": u, "type": "URL_UPDATED"}, timeout=30)
-            if r.status_code == 200: ok += 1
-            else: fail += 1; log("G fail", r.status_code, u, r.text[:120])
-            time.sleep(0.2)
-        except Exception as e:
-            fail += 1; log("G exc", u, e)
-    return {"ok": ok, "fail": fail}
+        log("inspect exc", url, e); return ("error", str(e)[:60])
 
-def indexnow(urls):
-    if not IN_KEY: return None
-    host = SITE.split("//")[-1]
-    payload = {"host": host, "key": IN_KEY,
-               "keyLocation": f"{SITE}/{IN_KEY}.txt",
-               "urlList": urls[:10000]}
+def push(sess, url):
     try:
-        r = requests.post("https://api.indexnow.org/indexnow",
-                          json=payload, headers={"Content-Type": "application/json; charset=utf-8"},
-                          timeout=40)
-        return {"status": r.status_code, "count": len(payload["urlList"])}
+        r = sess.post("https://indexing.googleapis.com/v3/urlNotifications:publish",
+                      json={"url": url, "type": "URL_UPDATED"}, timeout=30)
+        return r.status_code == 200
     except Exception as e:
-        log("indexnow err", e); return {"status": "err", "count": 0}
+        log("push exc", url, e); return False
 
 def tg(msg):
     try:
@@ -111,32 +99,60 @@ def tg(msg):
         log("tg err", e)
 
 def main():
-    all_urls = {}
-    parse_sitemap(f"{SITE}/sitemap_index.xml", all_urls)
-    if not all_urls:
-        parse_sitemap(f"{SITE}/wp-sitemap.xml", all_urls)
-    total = len(all_urls)
-    urls = recent_urls(all_urls, DAYS)
-    log(f"sitemap tổng {total} URL, mới/sửa trong {DAYS} ngày: {len(urls)}")
-
-    g = google_index(urls)
-    ix = indexnow(urls)
-
+    urls = []
+    parse_sitemap(f"{SITE}/sitemap_index.xml", urls)
+    if not urls:
+        parse_sitemap(f"{SITE}/wp-sitemap.xml", urls)
+    urls = list(dict.fromkeys(urls))  # unique giữ thứ tự
+    total = len(urls)
+    host = SITE.split("//")[-1]
     today = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=7)
-    lines = [f"🔎 <b>Ép index hàng ngày</b> — {today:%d/%m/%Y}",
-             f"Sitemap: <b>{total}</b> URL · cần đẩy (mới/sửa {DAYS} ngày): <b>{len(urls)}</b>"]
-    if g is None:
-        lines.append("• Google Indexing API: <i>chưa bật</i> (thêm secret GOOGLE_SA_JSON)")
-    elif "err" in g:
-        lines.append(f"• Google: ❌ lỗi xác thực ({html.escape(g['err'][:80])})")
+
+    if not SA_RAW:
+        tg(f"🔎 <b>Báo cáo Index</b> — {today:%d/%m/%Y}\n🌐 {host}\n"
+           f"⚠️ Chưa cấu hình Google (thiếu GOOGLE_SA_JSON) — sitemap {total} URL.")
+        return
+
+    sess = make_session()
+
+    indexed = notidx = errcnt = 0
+    not_list = []  # (url, cov)
+    for u in urls[:MAX_INSPECT]:
+        state, cov = inspect(sess, u)
+        if state == "indexed": indexed += 1
+        elif state == "not":
+            notidx += 1; not_list.append((u, cov))
+        else: errcnt += 1
+        time.sleep(0.25)  # tôn trọng 600 req/phút
+
+    # ép index lại các URL chưa index
+    pushed = 0
+    for u, _ in not_list[:MAX_PUSH]:
+        if push(sess, u): pushed += 1
+        time.sleep(0.2)
+
+    inspected = min(total, MAX_INSPECT)
+    lines = [f"📊 <b>Báo cáo Index</b> — {today:%d/%m/%Y}",
+             f"🌐 {host}",
+             f"✅ Đã index: <b>{indexed}</b>/{inspected}",
+             f"🟡 Chưa index: <b>{notidx}</b>",
+             f"🔴 Lỗi/Unknown: <b>{errcnt}</b>",
+             f"🚀 Vừa ép index lại: <b>{pushed}</b>"]
+    if total > MAX_INSPECT:
+        lines.append(f"ℹ️ Kiểm tra {MAX_INSPECT}/{total} URL (giới hạn quota/ngày)")
+
+    if not_list:
+        lines.append("\n<b>Một số URL chưa index:</b>")
+        for u, cov in not_list[:10]:
+            covvi = COV_VI.get(cov, cov)
+            lines.append(f"• {html.escape(u)} — <i>{html.escape(covvi)}</i>")
+        if len(not_list) > 10:
+            lines.append(f"… và {len(not_list)-10} URL khác")
     else:
-        lines.append(f"• Google: ✅ {g['ok']} URL"+(f" · lỗi {g['fail']}" if g['fail'] else ""))
-    if ix is None:
-        lines.append("• IndexNow: <i>chưa bật</i> (thêm secret INDEXNOW_KEY)")
-    else:
-        lines.append(f"• IndexNow (Bing/Cốc Cốc): {ix['count']} URL · HTTP {ix['status']}")
+        lines.append("\n🎉 Tất cả URL đã được index.")
+
     tg("\n".join(lines))
-    log("done")
+    log(f"done: indexed={indexed} not={notidx} err={errcnt} pushed={pushed}")
 
 if __name__ == "__main__":
     main()
